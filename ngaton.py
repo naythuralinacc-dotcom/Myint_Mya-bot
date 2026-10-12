@@ -1546,4 +1546,5 @@ async def handle_callbacks(update, context, *args, **kwargs):
                 parse_mode=ParseMode.HTML, reply_markup=get_mode_menu_markup())
             return
 
-        if data.startswith
+        if data.startswith(""):
+
