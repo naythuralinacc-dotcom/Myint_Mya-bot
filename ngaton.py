@@ -1545,5 +1545,3 @@ async def handle_callbacks(update, context, *args, **kwargs):
             await query.edit_message_text("📜 <b>SELECT MODE</b>",
                 parse_mode=ParseMode.HTML, reply_markup=get_mode_menu_markup())
             return
-
-        if data.startswith(""):
