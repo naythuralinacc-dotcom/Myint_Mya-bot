@@ -1547,4 +1547,3 @@ async def handle_callbacks(update, context, *args, **kwargs):
             return
 
         if data.startswith(""):
-
